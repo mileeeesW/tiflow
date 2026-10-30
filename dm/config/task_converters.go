@@ -15,10 +15,12 @@ package config
 
 import (
 	"fmt"
+	"sort"
 	"strings"
 
 	"github.com/pingcap/tidb/pkg/util/filter"
 	router "github.com/pingcap/tidb/pkg/util/table-router"
+	selector "github.com/pingcap/tidb/pkg/util/table-rule-selector"
 	"github.com/pingcap/tiflow/dm/config/dbconfig"
 	"github.com/pingcap/tiflow/dm/config/security"
 	"github.com/pingcap/tiflow/dm/openapi"
@@ -547,7 +549,10 @@ func SubTaskConfigsToOpenAPITask(subTaskConfigList []*SubTaskConfig) *openapi.Ta
 	}
 	// set filter rules
 	filterRuleMap := openapi.Task_BinlogFilterRule{}
+	// source name -> binder used to find out which filter rules take effect on a table migrate rule
+	filterBinderMap := make(map[string]*filterRuleBinder, len(filterMap))
 	for sourceName, ruleList := range filterMap {
+		filterBinderMap[sourceName] = newFilterRuleBinder(sourceName, ruleList)
 		for idx, rule := range ruleList {
 			binlogFilterRule := openapi.TaskBinLogFilterRule{}
 			var events []string
@@ -568,8 +573,13 @@ func SubTaskConfigsToOpenAPITask(subTaskConfigList []*SubTaskConfig) *openapi.Ta
 	// set table migrate rules
 	tableMigrateRuleList := []openapi.TaskTableMigrateRule{}
 	// used to remove repeated rules
-	ruleMap := map[string]struct{}{}
+	ruleMap := map[tableMigrateRuleKey]struct{}{}
 	appendOneRule := func(sourceName, schemaPattern, tablePattern, targetSchema, targetTable string) {
+		ruleKey := tableMigrateRuleKey{sourceName: sourceName, schemaPattern: schemaPattern, tablePattern: tablePattern}
+		if _, ok := ruleMap[ruleKey]; ok {
+			return
+		}
+		ruleMap[ruleKey] = struct{}{}
 		tableMigrateRule := openapi.TaskTableMigrateRule{
 			Source: struct {
 				Schema     string `json:"schema"`
@@ -592,18 +602,13 @@ func SubTaskConfigsToOpenAPITask(subTaskConfigList []*SubTaskConfig) *openapi.Ta
 				tableMigrateRule.Target.Table = &targetTable
 			}
 		}
-		if filterRuleList, ok := filterMap[sourceName]; ok {
-			ruleNameList := make([]string, len(filterRuleList))
-			for idx := range filterRuleList {
-				ruleNameList[idx] = genFilterRuleName(sourceName, idx)
+		// only bind the filter rules which take effect on the tables of this rule,
+		// see https://github.com/pingcap/tiflow/issues/12865
+		if binder, ok := filterBinderMap[sourceName]; ok {
+			if ruleNameList := binder.bind(schemaPattern, tablePattern); len(ruleNameList) > 0 {
+				tableMigrateRule.BinlogFilterRule = &ruleNameList
 			}
-			tableMigrateRule.BinlogFilterRule = &ruleNameList
 		}
-		ruleKey := strings.Join([]string{sourceName, schemaPattern, tablePattern}, "-")
-		if _, ok := ruleMap[ruleKey]; ok {
-			return
-		}
-		ruleMap[ruleKey] = struct{}{}
 		tableMigrateRuleList = append(tableMigrateRuleList, tableMigrateRule)
 	}
 	// gen migrate rules by route
@@ -625,6 +630,23 @@ func SubTaskConfigsToOpenAPITask(subTaskConfigList []*SubTaskConfig) *openapi.Ta
 				tablePattern := cfg.BAList.DoTables[idx].Name
 				appendOneRule(cfg.SourceID, schemaPattern, tablePattern, "", "")
 			}
+		}
+	}
+
+	// gen migrate rules by filter rules
+	// a filter rule matching none of the table migrate rules above (e.g. the task is created by dmctl and
+	// the filter rule is narrower than its block-allow list) gets a table migrate rule of its own pattern,
+	// otherwise it can't be referenced by any table migrate rule and is lost when the task is submitted again.
+	for _, cfg := range subTaskConfigList {
+		binder, ok := filterBinderMap[cfg.SourceID]
+		if !ok {
+			continue
+		}
+		for idx, rule := range cfg.FilterRules {
+			if binder.bound[idx] || rule.SchemaPattern == "" {
+				continue
+			}
+			appendOneRule(cfg.SourceID, rule.SchemaPattern, rule.TablePattern, "", "")
 		}
 	}
 
@@ -728,6 +750,76 @@ func removeDuplication(in []string) []string {
 func genFilterRuleName(sourceName string, idx int) string {
 	// NOTE that we don't have user input filter rule name in sub task config, so we make one by ourself
 	return fmt.Sprintf("%s-filter-rule-%d", sourceName, idx)
+}
+
+// tableMigrateRuleKey identifies an openapi.TaskTableMigrateRule by its upstream side.
+type tableMigrateRuleKey struct {
+	sourceName    string
+	schemaPattern string
+	tablePattern  string
+}
+
+// filterRuleBinder finds out which binlog filter rules of one source take effect on the tables
+// selected by a table migrate rule, so that only these filter rules are bound to the table migrate rule.
+type filterRuleBinder struct {
+	sourceName string
+	// (schema pattern, table pattern) -> indexes of the filter rules using exactly these patterns
+	exact map[[2]string][]int
+	// matches the schema/table of a table migrate rule against the patterns of the filter rules,
+	// the rule stored in it is the index of the filter rule
+	selector selector.Selector
+	// whether the filter rule at this index has been bound to at least one table migrate rule
+	bound []bool
+}
+
+func newFilterRuleBinder(sourceName string, rules []*bf.BinlogEventRule) *filterRuleBinder {
+	b := &filterRuleBinder{
+		sourceName: sourceName,
+		exact:      make(map[[2]string][]int, len(rules)),
+		selector:   selector.NewTrieSelector(),
+		bound:      make([]bool, len(rules)),
+	}
+	for idx, rule := range rules {
+		key := [2]string{rule.SchemaPattern, rule.TablePattern}
+		b.exact[key] = append(b.exact[key], idx)
+		// use Append so that several filter rules on the same pattern are all kept
+		if err := b.selector.Insert(rule.SchemaPattern, rule.TablePattern, idx, selector.Append); err != nil {
+			// such a rule never takes effect at runtime, it can still be bound by exactly the same pattern
+			log.L().Warn("invalid pattern of binlog filter rule, only bind it to the table migrate rule with the same pattern",
+				zap.String("source", sourceName), zap.String("schemaPattern", rule.SchemaPattern),
+				zap.String("tablePattern", rule.TablePattern), zap.Error(err))
+		}
+	}
+	return b
+}
+
+// bind returns the names of the filter rules taking effect on the tables selected by the schema/table pattern
+// of a table migrate rule, in the order of the filter rules in the sub task config.
+// A filter rule takes effect when its patterns are exactly the same as the given ones (this is how
+// OpenAPITaskToSubTaskConfigs generates filter rules), or when its patterns match the given ones
+// (e.g. a "*" filter rule of a task created by dmctl covers every table migrate rule of the source).
+func (b *filterRuleBinder) bind(schemaPattern, tablePattern string) []string {
+	idxSet := make(map[int]struct{})
+	for _, idx := range b.exact[[2]string{schemaPattern, tablePattern}] {
+		idxSet[idx] = struct{}{}
+	}
+	for _, matched := range b.selector.Match(schemaPattern, tablePattern) {
+		idxSet[matched.(int)] = struct{}{}
+	}
+	if len(idxSet) == 0 {
+		return nil
+	}
+	idxList := make([]int, 0, len(idxSet))
+	for idx := range idxSet {
+		idxList = append(idxList, idx)
+	}
+	sort.Ints(idxList)
+	ruleNameList := make([]string, 0, len(idxList))
+	for _, idx := range idxList {
+		b.bound[idx] = true
+		ruleNameList = append(ruleNameList, genFilterRuleName(b.sourceName, idx))
+	}
+	return ruleNameList
 }
 
 func OpenAPIStartTaskReqToTaskCliArgs(req openapi.StartTaskRequest) (*TaskCliArgs, error) {

@@ -628,3 +628,141 @@ func TestConvertBetweenOpenAPITaskAndTaskConfig(t *testing.T) {
 		require.EqualValues(t, taskAfterConvert, &task)
 	}
 }
+
+// TestSubTaskConfigsToOpenAPITaskBindFilterRuleByTable checks that a filter rule bound to one table when the task
+// is created is bound to the same table only when the task is read back.
+// See https://github.com/pingcap/tiflow/issues/12865.
+func TestSubTaskConfigsToOpenAPITaskBindFilterRuleByTable(t *testing.T) {
+	const (
+		sourceName  = "mysql-01"
+		taskJSONStr = `
+	{
+		"binlog_filter_rule": {
+		  "rule-1": { "ignore_event": ["delete"] }
+		},
+		"enhance_online_schema_change": true,
+		"meta_schema": "dm_meta",
+		"name": "test",
+		"on_duplicate": "replace",
+		"source_config": {
+		  "full_migrate_conf": {
+			"data_dir": "./exported_data",
+			"export_threads": 4,
+			"import_threads": 16
+		  },
+		  "incr_migrate_conf": { "repl_batch": 200, "repl_threads": 32 },
+		  "source_conf": [{ "source_name": "mysql-01" }]
+		},
+		"table_migrate_rule": [
+		  {
+			"source": { "schema": "db", "source_name": "mysql-01", "table": "t1" },
+			"binlog_filter_rule": ["rule-1"]
+		  },
+		  {
+			"source": { "schema": "db", "source_name": "mysql-01", "table": "t2" }
+		  }
+		],
+		"target_config": { "host": "127.0.0.1", "password": "123456", "port": 4000, "user": "root" },
+		"task_mode": "all",
+		"strict_optimistic_shard_mode": false
+	}`
+	)
+	task := openapi.Task{}
+	require.NoError(t, task.FromJSON([]byte(taskJSONStr)))
+	sourceCfg, err := SourceCfgFromYamlAndVerify(SampleSourceConfig)
+	require.NoError(t, err)
+	sourceCfg.SourceID = sourceName
+	sourceCfgMap := map[string]*SourceConfig{sourceName: sourceCfg}
+	toDBCfg := GetTargetDBCfgFromOpenAPITask(&task)
+
+	subTaskCfgs, err := OpenAPITaskToSubTaskConfigs(&task, toDBCfg, sourceCfgMap)
+	require.NoError(t, err)
+	require.Len(t, subTaskCfgs, 1)
+	require.Len(t, subTaskCfgs[0].FilterRules, 1)
+	require.Equal(t, "db", subTaskCfgs[0].FilterRules[0].SchemaPattern)
+	require.Equal(t, "t1", subTaskCfgs[0].FilterRules[0].TablePattern)
+
+	findRule := func(task *openapi.Task, schema, table string) *openapi.TaskTableMigrateRule {
+		for i := range task.TableMigrateRule {
+			rule := &task.TableMigrateRule[i]
+			if rule.Source.SourceName == sourceName && rule.Source.Schema == schema && rule.Source.Table == table {
+				return rule
+			}
+		}
+		return nil
+	}
+
+	// read the task back, the filter rule is only bound to db.t1
+	newTask := SubTaskConfigsToOpenAPITask(subTaskCfgs)
+	ruleName := genFilterRuleName(sourceName, 0)
+	require.NotNil(t, newTask.BinlogFilterRule)
+	require.Len(t, newTask.BinlogFilterRule.AdditionalProperties, 1)
+	filterRule, ok := newTask.BinlogFilterRule.Get(ruleName)
+	require.True(t, ok)
+	require.Equal(t, []string{"delete"}, *filterRule.IgnoreEvent)
+	require.Len(t, newTask.TableMigrateRule, 2)
+	t1Rule := findRule(newTask, "db", "t1")
+	require.NotNil(t, t1Rule)
+	require.NotNil(t, t1Rule.BinlogFilterRule)
+	require.Equal(t, []string{ruleName}, *t1Rule.BinlogFilterRule)
+	t2Rule := findRule(newTask, "db", "t2")
+	require.NotNil(t, t2Rule)
+	require.Nil(t, t2Rule.BinlogFilterRule)
+
+	// submit the task read back again, db.t2 is still not filtered
+	subTaskCfgs2, err := OpenAPITaskToSubTaskConfigs(newTask, toDBCfg, sourceCfgMap)
+	require.NoError(t, err)
+	require.Len(t, subTaskCfgs2, 1)
+	require.Len(t, subTaskCfgs2[0].FilterRules, 1)
+	require.Equal(t, subTaskCfgs[0].FilterRules[0], subTaskCfgs2[0].FilterRules[0])
+	require.Equal(t, subTaskCfgs[0].BAList, subTaskCfgs2[0].BAList)
+	require.Equal(t, newTask, SubTaskConfigsToOpenAPITask(subTaskCfgs2))
+}
+
+// TestSubTaskConfigsToOpenAPITaskBindFilterRuleByPattern checks the binding of filter rules whose patterns are not
+// exactly the same as any table migrate rule, which happens when the task is created by dmctl.
+func TestSubTaskConfigsToOpenAPITaskBindFilterRuleByPattern(t *testing.T) {
+	const sourceName = "mysql-01"
+	subTaskCfg := NewSubTaskConfig()
+	subTaskCfg.Name = "test"
+	subTaskCfg.SourceID = sourceName
+	subTaskCfg.BAList = &filter.Rules{
+		DoDBs:    []string{"db"},
+		DoTables: []*filter.Table{{Schema: "db2", Name: "t*"}},
+	}
+	subTaskCfg.FilterRules = []*bf.BinlogEventRule{
+		// covers every table migrate rule of the source
+		{SchemaPattern: "*", TablePattern: "*", Events: []bf.EventType{bf.TruncateTable}, Action: bf.Ignore},
+		// narrower than any table migrate rule, gets a table migrate rule of its own
+		{SchemaPattern: "db", TablePattern: "t1", Events: []bf.EventType{bf.DeleteEvent}, Action: bf.Ignore},
+		// exactly the same pattern as a table migrate rule
+		{SchemaPattern: "db2", TablePattern: "t*", SQLPattern: []string{"^DROP"}, Action: bf.Ignore},
+		// another rule on the same pattern as the second one
+		{SchemaPattern: "db", TablePattern: "t1", Events: []bf.EventType{bf.DropTable}, Action: bf.Ignore},
+	}
+
+	task := SubTaskConfigsToOpenAPITask([]*SubTaskConfig{subTaskCfg})
+	require.NotNil(t, task.BinlogFilterRule)
+	require.Len(t, task.BinlogFilterRule.AdditionalProperties, 4)
+	ruleNames := make([]string, 4)
+	for i := range ruleNames {
+		ruleNames[i] = genFilterRuleName(sourceName, i)
+		_, ok := task.BinlogFilterRule.Get(ruleNames[i])
+		require.True(t, ok)
+	}
+
+	expected := map[[2]string][]string{
+		{"db", ""}:    {ruleNames[0]},
+		{"db2", "t*"}: {ruleNames[0], ruleNames[2]},
+		{"db", "t1"}:  {ruleNames[0], ruleNames[1], ruleNames[3]},
+	}
+	require.Len(t, task.TableMigrateRule, len(expected))
+	for _, rule := range task.TableMigrateRule {
+		require.Equal(t, sourceName, rule.Source.SourceName)
+		require.Nil(t, rule.Target)
+		expectedNames, ok := expected[[2]string{rule.Source.Schema, rule.Source.Table}]
+		require.True(t, ok, "unexpected table migrate rule %s.%s", rule.Source.Schema, rule.Source.Table)
+		require.NotNil(t, rule.BinlogFilterRule)
+		require.Equal(t, expectedNames, *rule.BinlogFilterRule, "table migrate rule %s.%s", rule.Source.Schema, rule.Source.Table)
+	}
+}
